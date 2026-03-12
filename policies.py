@@ -8,17 +8,25 @@ class TransformerGaussianPolicy(torch.nn.Module):
     def __init__(self, state_dim, act_dim, n_transformer_layers=4, n_attn_heads=3):
         ''' 
             NOTE - I/P Shape : [seq_len, batch_size, state_dim]
+            static_dim: 观察空间的维度
+            act_dim: 动作空间的维度
+            n_transformer_layers: transformer层数
+            n_attn_heads: 注意力头数
         '''
         super(TransformerGaussianPolicy, self).__init__()
         self.state_dim = state_dim
         self.act_dim = act_dim
 
+        # 构建transformer模型，输入维度为状态维度，输出维度也是状态维度，层数和注意力头数根据参数设置
         self.transformer = StableTransformerXL(d_input=state_dim, n_layers=n_transformer_layers, 
             n_heads=n_attn_heads, d_head_inner=32, d_ff_inner=64)
         self.memory = None
 
-        self.head_sate_value = torch.nn.Linear(state_dim, 1)
+        # 预测状态的价值
+        self.head_state_value = torch.nn.Linear(state_dim, 1)
+        # 预测动作的均值，todo 这里的动作是离散值还是连续值
         self.head_act_mean = torch.nn.Linear(state_dim, act_dim)
+        # 这里是动作的标准差的log值
         log_std = -0.5 * np.ones(act_dim, dtype=np.float32)
         self.log_std = torch.nn.Parameter(torch.as_tensor(log_std))
 
@@ -34,6 +42,9 @@ class TransformerGaussianPolicy(torch.nn.Module):
         return policy.log_prob(action).sum(axis=-1) 
 
     def forward(self, state, action=None):
+        '''
+        state: 输入状态，形状为[seq_len, batch_size, state_dim]
+        '''
         trans_state = self.transformer(state, self.memory)
         trans_state, self.memory = trans_state['logits'], trans_state['memory']
 
@@ -65,6 +76,6 @@ if __name__ == '__main__':
     print("=> Testing Policy")
     policy = TransformerGaussianPolicy(state_dim=states.shape[-1], act_dim=4)
     for i in range(10):
-        act = policy(states)
+        act = policy(states) # 输入状态，进行预测
         action = act[0].sample()
         print(torch.isnan(action).any(), action.shape)
