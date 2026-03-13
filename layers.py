@@ -11,13 +11,18 @@ class PositionalEmbedding(torch.nn.Module):
 
         self.dim = dim
         # 这边是位置频率，用于构建位置编码中，每一个位置维度的频率，论文中建议设置为10000
+        # inv_freq shape is (dim/2)，每个位置维度的频率，频率越高的位置维度变化越快，频率越低的位置维度变化越慢
         inv_freq = 1 / (10000 ** (torch.arange(0.0, dim, 2.0) / dim))
         self.register_buffer("inv_freq", inv_freq)
 
     def forward(self, positions):
-        sinusoid_inp = torch.einsum("i,j->ij", positions.float(), self.inv_freq)
+        '''
+        positions: 位置索引，形状为[seq_len]，表示每个位置的索引，当前序列的位置索引为0，历史状态的位置索引为正数，距离越远的历史状态位置索引越大
+        '''
+        sinusoid_inp = torch.einsum("i,j->ij", positions.float(), self.inv_freq) # 看markdown
+        # 然后对计算得到的频率分别进行sin和cos变换，得到位置编码的不同维度，最后将sin和cos的结果拼接起来，得到最终的位置编码，形状为[seq_len, dim]
         pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
-        return pos_emb[:, None, :]
+        return pos_emb[:, None, :] # 在位置编码的基础上增加一个维度，形状变为[seq_len, 1, dim]，这个维度是为了后续计算注意力时能够广播到所有的批次
 
 
 class PositionwiseFF(torch.nn.Module):
@@ -371,10 +376,13 @@ class StableTransformerXL(torch.nn.Module):
             .to(inputs.device)
         )
 
+        # 位置编码，看起来应该是仅针对历史状态的位置编码
+        # pos_ips shape is （cur_seq + prev_seq），是一个从(cur_seq + prev_seq - 1)到0的递减序列，表示每个位置相对于当前序列的距离，当前序列的位置是0，历史状态的位置是正数，距离越远的历史状态位置数值越大
         pos_ips = torch.arange(cur_seq + prev_seq - 1, -1, -1.0, dtype=torch.float).to(
             inputs.device
         )
         # pos_embs = [curr + prev x 1 x d_input] = [40 x 1 x 8]
+        # pos_embs shape is (cur_seq + prev_seq, 1, d_input)，每个位置的编码，位置编码的维度和输入的维度相同
         pos_embs = self.drop(self.pos_embs(pos_ips))
         if self.d_input % 2 != 0:
             pos_embs = pos_embs[:, :, :-1]
