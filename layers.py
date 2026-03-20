@@ -122,12 +122,12 @@ class MultiHeadAttentionXL(torch.nn.Module):
         """
         + pos_embs: positional embeddings passed separately to handle relative positions.
         + Arguments
-            - input: torch.FloatTensor, shape - (seq, bs, self.d_input) = (20, 5, 8)
-            - pos_embs: torch.FloatTensor, shape - (seq + prev_seq, bs, self.d_input) = (40, 1, 8)
-            - memory: torch.FloatTensor, shape - (prev_seq, b, d_in) = (20, 5, 8)
-            - u: torch.FloatTensor, shape - (num_heads, inner_dim) = (3 x )
-            - v: torch.FloatTensor, shape - (num_heads, inner_dim)
-            - mask: torch.FloatTensor, Optional = (20, 40, 1)
+            - input: torch.FloatTensor, shape - (seq, bs, self.d_input) = (20, 5, 8) 输入的当前状态序列，seq是当前序列的长度，bs是批次大小，d_input是输入的维度
+            - pos_embs: torch.FloatTensor, shape - (seq + prev_seq, bs, self.d_input) = (40, 1, 8) 位置编码，包含当前序列和历史状态序列的位置编码，seq是当前序列的长度，prev_seq是历史状态序列的长度，bs是批次大小，d_input是输入的维度
+            - memory: torch.FloatTensor, shape - (prev_seq, b, d_in) = (20, 5, 8) 历史上的每层的状态序列，prev_seq是历史状态序列的长度，b是批次大小，d_in是输入的维度
+            - u: torch.FloatTensor, shape - (num_heads, inner_dim) = (3 x ) 全局参数，用于内容注意力的计算，num_heads是注意力头数，inner_dim是每个头的维度
+            - v: torch.FloatTensor, shape - (num_heads, inner_dim) = (3 x ) 全局参数，用于位置注意力的计算，num_heads是注意力头数，inner_dim是每个头的维度
+            - mask: torch.FloatTensor, Optional = (20, 40, 1) 注意力掩码，用于屏蔽掉当前序列中不可见的位置，通常是当前序列中未来的位置和历史状态中不可见的位置，shape为[seq, seq + prev_seq, 1]，seq是当前序列的长度，prev_seq是历史状态序列的长度
 
         + Returns
             - output: torch.FloatTensor, shape - (seq, bs, self.d_input)
@@ -138,22 +138,26 @@ class MultiHeadAttentionXL(torch.nn.Module):
         """
         cur_seq = input_.shape[0]
         prev_seq = memory.shape[0]
-        H, d = self.n_heads, self.d_inner
+        H, d = self.n_heads, self.d_inner # H 注意力头数、d 每个头的维度
         # concat memory across sequence dimension
         # input_with_memory = [seq + prev_seq x B x d_input] = [40 x 5 x 8]
+        # 将历史状态序列和当前状态序列在序列维度上拼接起来，得到一个新的输入序列，这个序列包含了当前状态和历史状态的信息，供后续的注意力计算使用
         input_with_memory = torch.cat([memory, input_], dim=0)
 
         # k_tfmd, v_tfmd = [seq + prev_seq x B x n_heads.d_head_inner], [seq + prev_seq x B x n_heads.d_head_inner]
+        # todo 这里为啥kv一起计算，q单独计算
+        # 将拼接后的输入序列通过线性变换得到键和值的表示
         k_tfmd, v_tfmd = torch.chunk(
             self.linear_kv(input_with_memory),
             2,
             dim=-1,
         )
         # q_tfmd = [seq x B x n_heads.d_head_inner] = [20 x 5 x 96]
+        # 进一步提取特征得到q
         q_tfmd = self.linear_q(input_)
 
         _, bs, _ = q_tfmd.shape
-        assert bs == k_tfmd.shape[1]
+        assert bs == k_tfmd.shape[1] # q k v的批次大小应该相同
 
         # content_attn = [curr x curr+prev x B x n_heads] = [20 x 40 x 5 x 3]
         content_attn = torch.einsum(
@@ -247,7 +251,15 @@ class StableTransformerEncoderLayerXL(torch.nn.Module):
         self.norm2 = torch.nn.LayerNorm(d_input)
 
     def forward(self, input_, pos_embs, u, v, mask=None, mems=None):
-        src2 = self.norm1(input_)
+        '''
+        input_: 输入的当前最新的状态记忆
+        pos_embes: 位置编码，包含当前状态和历史状态的位置编码
+        u, v: 全局参数，用于多头注意力层中的内容和位置注意力的计算 todo
+        mask: 注意力掩码，用于屏蔽掉当前序列中不可见的位置，通常是当前序列中未来的位置和历史状态中不可见的位置
+        mems: 历史状态序列，用于多头注意力层中的键和值的计算
+        '''
+
+        src2 = self.norm1(input_) # 对输入的当前状态进行层归一化，得到src2
         src2 = self.mha(src2, pos_embs, mems, u, v, mask=mask)
         src = self.gate1(input_, src2) if self.gating else input_ + src2
         src2 = self.ff(self.norm2(src))
@@ -387,6 +399,7 @@ class StableTransformerXL(torch.nn.Module):
         if self.d_input % 2 != 0:
             pos_embs = pos_embs[:, :, :-1]
 
+        # hidden_states 是一个列表，包含每一层的输入状态
         hidden_states = [inputs]
         layer_out = inputs
         for mem, layer in zip(memory, self.layers):
