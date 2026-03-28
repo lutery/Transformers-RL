@@ -32,7 +32,7 @@ class PositionwiseFF(torch.nn.Module):
         d_inner: feed forward层的维度
         dropout: dropout概率
 
-        todo 这个的作用是什么，为什么要在transformer中使用这个位置前馈网络
+        tranformer中的位置前馈网络，作用是对每个位置的表示进行非线性变换，增加模型的表达能力，同时也可以帮助模型更好地利用历史状态的信息，从而提高模型的性能
         '''
         super(PositionwiseFF, self).__init__()
 
@@ -56,7 +56,7 @@ class GatingMechanism(torch.nn.Module):
     def __init__(self, d_input, bg=0.1):
         '''
         d_input: 输入的维度，目前也是状态的维度
-        bg: gate的偏置项，论文中建议设置为0.1 todo
+        bg: gate的偏置项，论文中建议设置为0.1
         '''
         super(GatingMechanism, self).__init__()
         self.Wr = torch.nn.Linear(d_input, d_input)
@@ -71,10 +71,10 @@ class GatingMechanism(torch.nn.Module):
         self.tanh = torch.nn.Tanh()
 
     def forward(self, x, y):
-        r = self.sigmoid(self.Wr(y) + self.Ur(x))
-        z = self.sigmoid(self.Wz(y) + self.Uz(x) - self.bg)
-        h = self.tanh(self.Wg(y) + self.Ug(torch.mul(r, x)))
-        g = torch.mul(1 - z, x) + torch.mul(z, h)
+        r = self.sigmoid(self.Wr(y) + self.Ur(x)) # 这里得到的是旧的信息和新的信息混合时旧的信息的比重
+        z = self.sigmoid(self.Wz(y) + self.Uz(x) - self.bg) # 得到当前信息该保留多少新信息
+        h = self.tanh(self.Wg(y) + self.Ug(torch.mul(r, x))) # 对新旧信息进行混合，得到一个根据新旧信息总和出来的全新的信息
+        g = torch.mul(1 - z, x) + torch.mul(z, h) # 然后在根据z的值来决定最终输出的信息是更偏向于旧的信息还是新信息，z越大，输出的信息就越偏向于新信息，z越小，输出的信息就越偏向于旧信息
         return g
 
 
@@ -109,9 +109,15 @@ class MultiHeadAttentionXL(torch.nn.Module):
 
     def _rel_shift(self, x):
         # x shape: [curr x curr+prev x B x n_heads] = [20 x 40 x 5 x 3]
+        # zero_pad shape: [curr x 1 x B x n_heads] = [20 x 1 x 5 x 3]
         zero_pad = torch.zeros(
             (x.size(0), 1, *x.size()[2:]), device=x.device, dtype=x.dtype
         )
+
+        # torch.cat([zero_pad, x], dim=1) shape is [curr x curr+prev+1 x B x n_heads] = [20 x 41 x 5 x 3]
+        # .view(x.size(1) + 1, x.size(0), *x.size()[2:]) shape is [curr+prev+1 x curr x B x n_heads] = [41 x 20 x 5 x 3]
+        # [1:] shape is [curr+prev x curr x B x n_heads] = [40 x 20 x 5 x 3]
+        # .view_as(x) shape is [curr x curr+prev x B x n_heads] = [20 x 40 x 5 x 3]
         return (
             torch.cat([zero_pad, x], dim=1)
             .view(x.size(1) + 1, x.size(0), *x.size()[2:])[1:]
@@ -129,6 +135,7 @@ class MultiHeadAttentionXL(torch.nn.Module):
             - v: torch.FloatTensor, shape - (num_heads, inner_dim) = (3 x ) 全局参数，用于位置注意力的计算，num_heads是注意力头数，inner_dim是每个头的维度
             - mask: torch.FloatTensor, Optional = (20, 40, 1) 注意力掩码，用于屏蔽掉当前序列中不可见的位置，通常是当前序列中未来的位置和历史状态中不可见的位置，shape为[seq, seq + prev_seq, 1]，seq是当前序列的长度，prev_seq是历史状态序列的长度
 
+            对于u\v的作用看md
         + Returns
             - output: torch.FloatTensor, shape - (seq, bs, self.d_input)
 
@@ -145,7 +152,7 @@ class MultiHeadAttentionXL(torch.nn.Module):
         input_with_memory = torch.cat([memory, input_], dim=0)
 
         # k_tfmd, v_tfmd = [seq + prev_seq x B x n_heads.d_head_inner], [seq + prev_seq x B x n_heads.d_head_inner]
-        # todo 这里为啥kv一起计算，q单独计算
+        # 这里为啥kv一起计算，q单独计算：因为kv是带有历史状态的序列，方便后续通过q现在的状态去计算每一个位置和历史状态的注意力分数，而q是当前状态的序列，不带有历史状态，方便后续通过q和位置编码计算位置注意力分数
         # 将拼接后的输入序列通过线性变换得到键和值的表示
         k_tfmd, v_tfmd = torch.chunk(
             self.linear_kv(input_with_memory),
@@ -153,46 +160,60 @@ class MultiHeadAttentionXL(torch.nn.Module):
             dim=-1,
         )
         # q_tfmd = [seq x B x n_heads.d_head_inner] = [20 x 5 x 96]
-        # 进一步提取特征得到q
+        # 进一步提取特征得到q，注意这里的q只有当前状态，用于后续使用当前状态和历史状态的注意力计算，k和v包含了当前状态和历史状态的信息
         q_tfmd = self.linear_q(input_)
 
         _, bs, _ = q_tfmd.shape
         assert bs == k_tfmd.shape[1] # q k v的批次大小应该相同
 
-        # content_attn = [curr x curr+prev x B x n_heads] = [20 x 40 x 5 x 3]
+        # content_attn = [curr x curr+prev x B x n_heads] = [20 x 40 x 5 x 3] 
+        # q*k得到每一个位置和历史状态的每一个位置的注意力分数，u是全局参数，用于内容注意力的计算，q和k的每个头的表示都加上u，得到内容注意力分数
+        '''
+        第一个张量下标是 i b h d
+        第二个张量下标是 j b h d
+        输出保留 i j b h
+        没出现在输出里的维度 d 会被求和
+        '''
         content_attn = torch.einsum(
             "ibhd,jbhd->ijbh",
             (
-                (q_tfmd.view(cur_seq, bs, H, d) + u),
-                k_tfmd.view(cur_seq + prev_seq, bs, H, d),
+                (q_tfmd.view(cur_seq, bs, H, d) + u), # [i, b, h, d] 含义是当前序列里每个位置的 query, 这里额外加了 u，它是 Transformer-XL 里的全局 content bias，会广播到每个位置和 batch
+                k_tfmd.view(cur_seq + prev_seq, bs, H, d), # [j, b, h, d] 含义是 key，既包含当前序列，也包含 memory 里的历史序列
             ),
-        )
+        ) # content_attn shape is [curr ， curr+prev ， B ， n_heads] = [20 x 40 x 5 x 3]，每个位置和历史状态的每个位置的注意力分数，u是全局参数，用于内容注意力的计算，q和k的每个头的表示都加上u，得到内容注意力分数
 
         # p_tfmd: [seq + prev_seq x 1 x n_heads.d_head_inner] = [40 x 1 x 96]
-        p_tfmd = self.linear_p(pos_embs)
+        p_tfmd = self.linear_p(pos_embs) # 对位置编码进行线性变换得到位置特征，位置特征包含了每个位置的位置信息，编码后的维度是n_heads.d_head_inner，供后续的注意力计算使用
         # position_attn = [curr x curr+prev x B x n_heads] = [20 x 40 x 5 x 3]
+        # 这里就可以理解为用q 和 位置信息计算位置注意力分数，让模型知道该关注哪些位置的特征
         position_attn = torch.einsum(
             "ibhd,jhd->ijbh",
             (
                 (q_tfmd.view(cur_seq, bs, H, d) + v),
                 p_tfmd.view(cur_seq + prev_seq, H, d),
             ),
-        )
-
+        ) # position_attn shape is [curr ， curr+prev ， B ， n_heads] = [20 x 40 x 5 x 3]，每个位置和历史状态的每个位置的注意力分数，v是全局参数，用于位置注意力的计算，q和位置特征的每个头的表示都加上v，得到位置注意力分数
+        
+        # 这里的作用可以理解为：目前的位置编码依旧是对所有序列相同的位置编码
+        # 但是由于这里的下三角矩阵，每一行的的当前状态的位置是不一样的，那么位置编码的0的位置也不一样
+        # 所以通过_rel_shift，将位置编码每一行的0位置对齐到当前状态的位置，这样每一行的当前状态的位置编码都是0，历史状态的位置编码是正数，距离越远的位置编码越大，这样模型就可以通过位置编码知道每个位置和当前状态的距离，从而更好地计算注意力分数，关注距离合适的位置特征
+        # 具体看 markdown 里的图示
         position_attn = self._rel_shift(position_attn)
         # attn = [curr x curr+prev x B x n_heads] = [20 x 40 x 5 x 3]
         attn = content_attn + position_attn
 
         if mask is not None and mask.any().item():
+            # 这里是对计算出来的注意力分数进行掩码处理，将不可见的位置的注意力分数设置为负无穷，这样在后续的softmax计算中，这些位置的注意力权重就会被置为0，达到屏蔽的效果
             # fills float('-inf') where mask is True.
             attn = attn.masked_fill(mask[..., None], -float("inf"))
         # rescale to prevent values from exploding.
         # normalize across the value sequence dimension.
-        attn = torch.softmax(attn * self.scale, dim=1)
+        attn = torch.softmax(attn * self.scale, dim=1) # 这里是缩放注意力的分数，避免过大影响训练
         # attn = [curr x curr+prev x B x n_heads] = [20 x 40 x 5 x 3]
-        attn = self.dropa(attn)
+        attn = self.dropa(attn) # 注意力dropout，随机丢弃一些注意力分数，防止过拟合
 
         # attn_weighted_values = [curr x B x n_heads.d_inner] = [20 x 5 x 96]
+        # 根据计算出来的注意力分数对值进行加权求和，得到每个位置的新的表示，这个表示包含了当前状态和历史状态的信息，供后续的输出使用
         attn_weighted_values = (
             torch.einsum(
                 "ijbh,jbhd->ibhd",
@@ -206,11 +227,13 @@ class MultiHeadAttentionXL(torch.nn.Module):
         )  # (cs, b, H * d)
 
         # output = [curr x B x d_input] = [20 x 5 x 8]
+        # 对加权后的值进行线性变换和dropout，得到最终的输出
         output = self.dropo(self.lout(attn_weighted_values))
         return output
 
 
 class StableTransformerEncoderLayerXL(torch.nn.Module):
+    # 根据这里的代码可以看到。GrTrx最重要的机制就是将原有的短接链接替换成了门控机制，这样可以更好地控制信息流动，防止梯度消失或者爆炸，同时也可以让模型更好地利用历史状态的信息，从而提高模型的性能
     def __init__(
         self,
         n_heads,
@@ -245,7 +268,6 @@ class StableTransformerEncoderLayerXL(torch.nn.Module):
             dropout=dropout,
             dropouta=dropouta,
         )
-        # todo 这个是干嘛的？
         self.ff = PositionwiseFF(d_input, d_ff_inner, dropout)
         self.norm1 = torch.nn.LayerNorm(d_input)
         self.norm2 = torch.nn.LayerNorm(d_input)
@@ -254,16 +276,16 @@ class StableTransformerEncoderLayerXL(torch.nn.Module):
         '''
         input_: 输入的当前最新的状态记忆
         pos_embes: 位置编码，包含当前状态和历史状态的位置编码
-        u, v: 全局参数，用于多头注意力层中的内容和位置注意力的计算 todo
+        u, v: 全局参数，用于多头注意力层中的内容和位置注意力的计算
         mask: 注意力掩码，用于屏蔽掉当前序列中不可见的位置，通常是当前序列中未来的位置和历史状态中不可见的位置
         mems: 历史状态序列，用于多头注意力层中的键和值的计算
         '''
 
         src2 = self.norm1(input_) # 对输入的当前状态进行层归一化，得到src2
         src2 = self.mha(src2, pos_embs, mems, u, v, mask=mask)
-        src = self.gate1(input_, src2) if self.gating else input_ + src2
-        src2 = self.ff(self.norm2(src))
-        src = self.gate2(src, src2) if self.gating else src + src2
+        src = self.gate1(input_, src2) if self.gating else input_ + src2 # 这里就是GrTxL的核心，使用门控机制来融合输入的当前状态和多头注意力层的输出，得到新的状态表示src，这个表示包含了当前状态和历史状态的信息，供后续的feed forward层使用
+        src2 = self.ff(self.norm2(src))  # 对融合后的状态表示进行层归一化，然后通过位置前馈网络得到新的状态表示src2，这个表示包含了当前状态和历史状态的信息，供后续的输出使用
+        src = self.gate2(src, src2) if self.gating else src + src2 # 这里同样使用门控机制来融合前馈网络的输出和之前融合后的状态表示，得到最终的输出状态表示src，这个表示包含了当前状态和历史状态的信息，供后续的层使用
         return src
 
 
@@ -318,6 +340,7 @@ class StableTransformerXL(torch.nn.Module):
         )
 
         # u and v are global parameters: maybe changing these to per-head parameters might help performance?
+        # 看md文档，u和v是Transformer-XL中的全局参数，用于多头注意力层中的内容和位置注意力的计算，u用于内容注意力的计算，v用于位置注意力的计算，这两个参数会被广播到每个位置和每个头上，帮助模型更好地计算注意力分数，从而提高模型的性能
         self.u, self.v = (
             # [n_heads x d_head_inner] = [3 x 32]
             torch.nn.Parameter(torch.zeros(self.n_heads, self.d_head_inner)),
@@ -341,11 +364,11 @@ class StableTransformerXL(torch.nn.Module):
     def update_memory(self, previous_memory, hidden_states):
         """
         + Arguments
-            - previous_memory: List[torch.FloatTensor],
-            - hidden_states: List[torch.FloatTensor]
+            - previous_memory: List[torch.FloatTensor], 之前的记忆
+            - hidden_states: List[torch.FloatTensor] 当前的隐藏状态，每一层的输入状态，长度应该和之前的记忆长度相同
         """
-        assert len(hidden_states) == len(previous_memory)
-        mem_len, seq_len = previous_memory[0].size(0), hidden_states[0].size(0)
+        assert len(hidden_states) == len(previous_memory) # 维度必须相同
+        mem_len, seq_len = previous_memory[0].size(0), hidden_states[0].size(0) # mem_len是之前的记忆长度，seq_len是当前的序列长度  
         # mem_len, seq_len = 3, hidden_states[0].size(0)
         # print(mem_len, seq_len)
 
@@ -353,14 +376,15 @@ class StableTransformerXL(torch.nn.Module):
             new_memory = []
             end_idx = mem_len + seq_len
             beg_idx = max(0, end_idx - self.mem_len)
-            for m, h in zip(previous_memory, hidden_states):
-                cat = torch.cat([m, h], dim=0)
-                new_memory.append(cat[beg_idx:end_idx].detach())
-        return new_memory
+            for m, h in zip(previous_memory, hidden_states): # 遍历每一层的之前的记忆和当前的输入状态
+                cat = torch.cat([m, h], dim=0) # 将之前的记忆和当前的输入状态在序列维度上拼接起来，得到一个新的序列，这个序列包含了之前的记忆和当前的输入状态的信息，供后续的更新使用
+                new_memory.append(cat[beg_idx:end_idx].detach()) # 从拼接后的序列中截取出最新的mem_len长度的序列作为新的记忆，这样就保证了记忆的长度不会超过mem_len，同时也保证了记忆中包含了最新的输入状态的信息，detach()是为了将新的记忆从计算图中分离出来，避免梯度传播到之前的记忆中，保持记忆的稳定性
+        return new_memory # 返回更新后的记忆，这个记忆将会被传递到下一次的前向传播中，供后续的注意力计算使用
 
     def forward(self, inputs, memory=None):
         """
         + Arguments
+        看另一份代码看看输入的inputs seq序列是什么堆叠起来的，根据另一份代码，这里的当前状态的seq就是当前时间步的序列，没有帧堆叠，也没有历史状态
             - inputs - torch.FloatTensor = [T x B x d_inner] = [20 x 5 x 8] 输入状态序列 shape 为[seq_len, batch_size, state_dim]
             - memory - Optional, list[torch.FloatTensor] = [[T x B x d_inner] x 5] 历史状态序列，每一层的历史状态 shape 为[prev_seq_len, batch_size, state_dim]
         """
@@ -372,7 +396,7 @@ class StableTransformerXL(torch.nn.Module):
         assert len(memory) == len(self.layers) + 1 
 
         cur_seq, bs = inputs.shape[:2]
-        prev_seq = memory[0].size(0) # prev_seq 这个shape是什么？是历史状态序列的长度吗？确认一下
+        prev_seq = memory[0].size(0) # prev_seq 是之前的记忆长度
 
         # dec_attn_mask = [curr x curr + prev x 1] = [20 x 40 x 1]
         # torch.ones 实在构建一个shape 为(curr_seq, cur_seq + prev_seq)的全1张量，当前序列的每个位置，对“历史 + 当前序列”所有位置的注意力关系。
@@ -396,6 +420,7 @@ class StableTransformerXL(torch.nn.Module):
         # pos_embs = [curr + prev x 1 x d_input] = [40 x 1 x 8]
         # pos_embs shape is (cur_seq + prev_seq, 1, d_input)，每个位置的编码，位置编码的维度和输入的维度相同
         pos_embs = self.drop(self.pos_embs(pos_ips))
+        # 这里是为了能够支持输入维度为奇数的情况，因为位置编码是通过sin和cos函数交替生成的，所以位置编码的维度必须是偶数，如果输入维度是奇数，就需要将位置编码的最后一个维度去掉，保证位置编码的维度和输入的维度相同
         if self.d_input % 2 != 0:
             pos_embs = pos_embs[:, :, :-1]
 
@@ -404,6 +429,7 @@ class StableTransformerXL(torch.nn.Module):
         layer_out = inputs
         for mem, layer in zip(memory, self.layers):
             # layer_out = [curr x B x d_inner] = [20 x 5 x 8]
+            # 将当前层的输入状态、位置编码、全局参数u和v、注意力掩码和历史状态序列传入当前层，得到当前层的输出状态，当前层的输出状态也会被存储在hidden_states列表中，供后续层使用
             layer_out = layer(
                 layer_out,
                 pos_embs,
